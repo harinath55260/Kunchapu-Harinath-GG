@@ -1,0 +1,170 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Security Primitives & Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (request.auth.token.email != null && request.auth.token.email.lower() == 'hariharinath55260@gmail.com')
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation helper for video submission
+    function isValidVideo(data) {
+      return data.title is string && data.title.size() > 0 && data.title.size() <= 200 &&
+             data.description is string && data.description.size() <= 2000 &&
+             data.youtubeUrl is string && data.youtubeUrl.size() <= 500 &&
+             data.youtubeVideoId is string && data.youtubeVideoId.size() <= 32 &&
+             data.countryId is string && data.countryId.size() <= 64 &&
+             data.categoryId is string && data.categoryId.size() <= 64 &&
+             data.contributorId is string && data.contributorId.size() <= 128 &&
+             (data.status == 'pending' || data.status == 'approved' || data.status == 'rejected');
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isAdmin() || isSignedIn();
+      allow list: if isSignedIn();
+      allow create: if isOwner(userId) &&
+        isValidId(userId) &&
+        incoming().id == request.auth.uid &&
+        (!incoming().keys().hasAny(['role']) || incoming().role == 'user' || isAdmin());
+      allow update: if (
+        isOwner(userId) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoUrl', 'bio', 'country', 'updatedAt', 'videoCount'])
+      ) || isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // Admins Collection
+    match /admins/{userId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Countries Collection (Curated cultural knowledge)
+    match /countries/{countryId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Categories Collection (Cultural categories)
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Videos Collection
+    match /videos/{videoId} {
+      allow read: if true;
+      allow create: if isSignedIn() &&
+        isValidId(videoId) &&
+        isValidVideo(incoming()) &&
+        incoming().contributorId == request.auth.uid &&
+        (incoming().status == 'pending' || incoming().status == 'approved' || isAdmin());
+      allow update: if (
+        // Action 1: Contributor edit while pending
+        (isSignedIn() && resource.data.contributorId == request.auth.uid && resource.data.status == 'pending' &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'title', 'description', 'youtubeUrl', 'youtubeVideoId', 'thumbnail',
+           'countryId', 'countryName', 'region', 'categoryId', 'categoryName',
+           'topic', 'tags', 'updatedAt'
+         ])) ||
+        // Action 2: Community engagement counter increments
+        (isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly([
+          'likesCount', 'savesCount', 'commentsCount', 'views', 'updatedAt'
+        ])) ||
+        // Action 3: Admin moderation & curation
+        isAdmin()
+      );
+      // User can delete their own uploaded video at any time, or Admin can delete
+      allow delete: if isAdmin() || (isSignedIn() && (
+        resource.data.contributorId == request.auth.uid ||
+        !('contributorId' in resource.data) ||
+        resource.data.contributorId == null ||
+        resource.data.contributorId == ''
+      ));
+    }
+
+    // Likes Collection
+    match /likes/{likeId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && isValidId(likeId) && incoming().userId == request.auth.uid;
+      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // Saved Videos Collection
+    match /savedVideos/{saveId} {
+      allow read: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && isValidId(saveId) && incoming().userId == request.auth.uid;
+      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // Comments Collection
+    match /comments/{commentId} {
+      allow read: if true;
+      allow create: if isSignedIn() &&
+        isValidId(commentId) &&
+        incoming().userId == request.auth.uid &&
+        incoming().text is string &&
+        incoming().text.size() > 0 &&
+        incoming().text.size() <= 1000;
+      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // Follows Collection
+    match /follows/{followId} {
+      allow read: if true;
+      allow create: if isSignedIn() &&
+        isValidId(followId) &&
+        incoming().followerId == request.auth.uid &&
+        incoming().followerId != incoming().followingId;
+      allow delete: if isSignedIn() && (resource.data.followerId == request.auth.uid || isAdmin());
+    }
+
+    // Reports Collection
+    match /reports/{reportId} {
+      allow read: if isAdmin() || (isSignedIn() && resource.data.reportedBy == request.auth.uid);
+      allow create: if isSignedIn() &&
+        isValidId(reportId) &&
+        incoming().reportedBy == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // Notifications Collection
+    match /notifications/{notificationId} {
+      allow read: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() &&
+        resource.data.userId == request.auth.uid &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+    }
+  }
+}
